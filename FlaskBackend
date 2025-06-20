@@ -1,0 +1,1244 @@
+from PIL.ExifTags import TAGS, GPSTAGS
+from PIL import Image, ImageEnhance
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import os
+from io import BytesIO
+from skimage.filters import sobel
+from google.cloud import firestore
+import firebase_admin
+from firebase_admin import credentials, firestore, storage
+import datetime
+import json
+from flask import Flask, request, jsonify
+
+# Initialise Flask app
+app = Flask(__name__)
+
+
+# EXIF data extraction #
+'''
+def extract_metadata_from_image(image_path):
+    try:
+        # Open the image using PIL
+        image = Image.open(image_path)
+    except Exception as e:
+        print(f"Error opening image: {e}")
+        return None
+
+    # Use the public getexif() method
+    exif_data = image.getexif()
+    metadata = {}
+
+    if exif_data is not None:
+        for tag, value in exif_data.items():
+            tag_name = TAGS.get(tag, tag)
+            # Convert IFDRational to string to make it JSON serializable
+            if isinstance(value, tuple):
+                value = tuple(str(v) for v in value)
+            elif isinstance(value, bytes):
+                value = value.decode(errors="ignore")
+            else:
+                value = str(value)
+            metadata[tag_name] = value
+
+        # Process GPSInfo separately if it exists
+        if 'GPSInfo' in metadata:
+            gps_info = metadata['GPSInfo']
+            gps_data = {}
+            for tag, value in gps_info.items():
+                tag_name = GPSTAGS.get(tag, tag)
+                # Convert IFDRational to string to make it JSON serializable
+                if isinstance(value, tuple):
+                    value = tuple(str(v) for v in value)
+                elif isinstance(value, bytes):
+                    value = value.decode(errors="ignore")
+                else:
+                    value = str(value)
+                gps_data[tag_name] = value
+            metadata['GPSInfo'] = gps_data
+
+        # Print the metadata being stored
+        print("Extracted Metadata:")
+        for key, value in metadata.items():
+            print(f"{key}: {value}")
+
+        # Save the extracted metadata to a file
+        with open("metadata_imported2.txt", "w") as file:
+            for key, value in metadata.items():
+                file.write(f"{key}: {value}\n")
+
+    else:
+        print("No EXIF data found in the image.")
+
+    return metadata
+'''
+
+# Brightness adjustment #
+
+def adjust_brightness(image: np.ndarray, target_brightness: float = 0.5, min_brightness: float = 0.01, threshold: float = 0.1) -> np.ndarray:
+    # Convert image to grayscale to calculate brightness
+    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    mean_brightness = np.mean(gray_image) / 255.0
+
+    # Ensure mean_brightness is above a minimum threshold
+    mean_brightness = max(mean_brightness, min_brightness)
+
+    # Calculate the adjustment factor
+    adjustment_factor = target_brightness / mean_brightness
+
+    # Check if the adjustment is needed
+    if adjustment_factor < 1 - threshold:  # If the image is too dark
+        adjustment_factor = 1 - threshold  # Do not darken the image
+    elif adjustment_factor > 1 + threshold:  # If the image is bright enough
+        adjustment_factor = min(adjustment_factor, 1.5)  # Limit how much we brighten
+
+    # Convert the image to RGB for PIL processing
+    pil_image: Image.Image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+
+    # Use ImageEnhance to adjust brightness
+    enhancer = ImageEnhance.Brightness(pil_image)
+    pil_image = enhancer.enhance(adjustment_factor)
+
+    # Convert the image back to BGR for OpenCV processing
+    adjusted_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+
+    return adjusted_image
+
+
+
+# Object detection #
+# Define the mapping from class_id to patch names // this is also done during yolo training
+class_id_to_patch_name = {
+    0: "test strip",
+    1: "total_hardness",
+    2: "total_chlorine",
+    3: "free_chlorine",
+    4: "bromine",
+    5: "total_alkalinity",
+    6: "pH",
+   # If "upside down strip"or "rotated strip" is found, orientation is unacceptable
+}
+
+def detect_objects(image):
+    model_path = os.path.join(
+        'C:/Users/user/PycharmProjects/pythonProject10/YOLO/train5/weights/best.pt')
+    model = YOLO(model_path)
+
+    # Convert image from BGR to RGB (since YOLO might expect RGB format)
+    frame = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+    # Perform object detection
+    results = model(frame)
+
+    orientation_acceptable = False  # Default as not acceptable
+    detections = []
+    detected_classes = set()
+
+    # Iterate through results and detections
+    for result in results:
+        for box in result.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            score = box.conf[0]  # Confidence score
+            class_id = int(box.cls[0])  # Detected class ID
+            patch_name = class_id_to_patch_name.get(class_id, "unknown")
+
+            # Append detection data
+            detections.append({
+                'bounding_box': (x1, y1, x2, y2),
+                'class_id': class_id,
+                'patch_name': patch_name,
+                'score': float(score)
+            })
+            detected_classes.add(patch_name)
+
+            # Check if class 0 is detected with a high confidence score
+            if score > 0.6 and class_id == 0:
+                orientation_acceptable = True
+
+    # If the orientation is not acceptable, return an error message
+    if not orientation_acceptable:
+        return "Error: Image orientation is incorrect. Please re-upload the image."
+
+    # Return detections, detected classes, and orientation status
+    return detections, detected_classes, orientation_acceptable
+
+
+# Orientation redundancy - rotation code #
+def find_edges(image):
+    image_edges = sobel(image)
+    return image_edges
+
+
+def find_orientation(image_edges):
+    gradient_x = np.gradient(image_edges, axis=1)
+    gradient_y = np.gradient(image_edges, axis=0)
+    orientation = np.arctan2(gradient_y, gradient_x)
+    return orientation
+
+
+def determine_rotation_angle(orientation):
+    rotation_angle = -np.degrees(np.median(orientation))
+    return rotation_angle
+
+
+def check_alignment(rotation_angle, threshold):
+    if abs(rotation_angle) <= threshold or abs(rotation_angle - 180) <= threshold or abs(rotation_angle + 180) <= threshold:
+        return "Image successfully uploaded."
+    else:
+        return "The test strip is not correctly aligned. Please reposition the strip and retake the image."
+
+
+def general_pipeline(image):
+    image_edges = find_edges(image)
+    orientation = find_orientation(image_edges)
+    rotation_angle = determine_rotation_angle(orientation)
+    threshold = 5
+    alignment_message = check_alignment(abs(rotation_angle), threshold)
+
+    return rotation_angle, alignment_message
+
+
+# White balance using the Gray World Assumption #
+def perform_white_balance(image, tolerance=0.1):
+    # Convert image to float64 for precision
+    r, g, b = cv2.split(image.astype(np.float64))
+
+    # Calculate the average of each channel
+    r_avg = np.mean(r)
+    g_avg = np.mean(g)
+    b_avg = np.mean(b)
+
+    # Compute the overall average (gray world assumption)
+    overall_avg = (r_avg + g_avg + b_avg) / 3.0
+
+    # Calculate gain for each channel
+    r_gain = overall_avg / r_avg
+    g_gain = overall_avg / g_avg
+    b_gain = overall_avg / b_avg
+
+    # Check if the white balance is already satisfactory (closer to the overall average)
+    if (abs(r_gain - 1) < tolerance) and (abs(g_gain - 1) < tolerance) and (abs(b_gain - 1) < tolerance):
+        print("White balance is already satisfactory. Skipping adjustment...")
+        return image
+
+    # Apply gain to each channel
+    r = np.clip(r * r_gain, 0, 255).astype(np.uint8)
+    g = np.clip(g * g_gain, 0, 255).astype(np.uint8)
+    b = np.clip(b * b_gain, 0, 255).astype(np.uint8)
+
+    # Merge the channels back
+    balanced_image = cv2.merge([r, g, b])
+
+    return balanced_image
+
+
+# Glare detection and removal #
+def detect_glare(image, glare_threshold=0.6, block_size=80):
+    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(block_size, block_size))
+    contrast_image = clahe.apply(gray_image)
+
+    mean_brightness = np.mean(contrast_image) / 255.0
+
+    has_glare = mean_brightness >= glare_threshold
+
+    contours, _ = cv2.findContours(contrast_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    glare_roi_coordinates = [cv2.boundingRect(contour) for contour in contours]
+
+    return has_glare, glare_roi_coordinates
+
+
+def process_glare(image, glare_roi_coordinates):
+    mask = np.zeros(image.shape[:2], dtype=np.uint8)
+
+    for x, y, w, h in glare_roi_coordinates:
+        mask[y:y + h, x:x + w] = 255
+
+    glare_result = cv2.bitwise_and(image, image, mask=cv2.bitwise_not(mask))
+    return glare_result
+
+
+def remove_glare(image):
+    glare_detected, glare_regions = detect_glare(image)
+    if glare_detected:
+        image_without_glare = process_glare(image, glare_regions)
+    else:
+        image_without_glare = image
+    return image_without_glare
+
+
+# Colour extraction and classification code #...
+# Predefined colours and their respective HSV range corresponding to colour chart___
+
+'''
+colour_shades = [
+    {
+        "patch_name": "total_hardness",
+        "colours": [
+            {
+                "lower": np.array([43, 71, 39]),
+                "upper": np.array([68, 68, 29]),
+                "contaminant": 'Total hardness',
+                "colour detected": 'Dark muted green',
+                "value": '0 ppm',
+            },
+            {
+                "lower": np.array([35, 50, 50]),
+                "upper": np.array([50, 255, 120]),
+                "contaminant": 'Total hardness',
+                "colour detected": 'Muddy green',
+                "value": '25 ppm',
+            },
+            {
+                "lower": np.array([29, 71, 40]),
+                "upper": np.array([32, 96, 32]),
+                "contaminant": 'Total hardness',
+                "colour detected": 'Dark olive green-brown',
+                "value": '50 ppm',
+            },
+            {
+                "lower": np.array([10, 30, 30]),
+                "upper": np.array([30, 70, 60]),
+                "contaminant": 'Total hardness',
+                "colour detected": 'Red-brown',
+                "value": '120 ppm',
+            },
+            {
+                "lower": np.array([16, 97, 44]),
+                "upper": np.array([20, 92, 51]),
+                "contaminant": 'Total hardness',
+                "colour detected": 'Burnt-umber red',
+                "value": '250 ppm',
+            },
+            {
+                "lower": np.array([13, 92, 51]),
+                "upper": np.array([16, 96, 50]),
+                "contaminant": 'Total hardness',
+                "colour detected": 'Bright red ochre',
+                "value": '425 ppm',
+            },
+        ],
+    },
+    {
+        "patch_name": "total_chlorine",
+        "colours": [
+            {
+                "lower": np.array([20, 10, 150]),
+                "upper": np.array([30, 70, 255]),
+                "contaminant": 'Total chlorine',
+                "colour detected": 'Light beige/cream',
+                "value": '0 ppm',
+            },
+            {
+                "lower": np.array([20, 20, 200]),
+                "upper": np.array([40, 100, 255]),
+                "contaminant": 'Total chlorine',
+                "colour detected": 'Light lime',
+                "value": '1 ppm',  # Should be <1
+            },
+            {
+                "lower": np.array([81, 63, 70]),
+                "upper": np.array([89, 53, 78]),
+                "contaminant": 'Total chlorine',
+                "colour detected": 'Lime',
+                "value": '3 ppm',
+            },
+            {
+                "lower": np.array([75, 71, 62]),
+                "upper": np.array([77, 68, 68]),
+                "contaminant": 'Total chlorine',
+                "colour detected": 'Pear',
+                "value": '5 ppm',
+            },
+            {
+                "lower": np.array([93, 71, 68]),
+                "upper": np.array([103, 70, 70]),
+                "contaminant": 'Total chlorine',
+                "colour detected": 'Green',
+                "value": '10 ppm',
+            },
+            {
+                "lower": np.array([94, 64, 56]),
+                "upper": np.array([108, 56, 57]),
+                "contaminant": 'Total chlorine',
+                "colour detected": 'Fern green',
+                "value": '20 ppm',
+            },
+        ],
+    },
+    {
+        "patch_name": "free_chlorine",
+        "colours": [
+            {
+                "lower": np.array([0, 0, 200]),
+                "upper": np.array([180, 30, 255]),
+                "contaminant": 'Free chlorine',
+                "colour detected": 'White',
+                "value": '0 ppm',
+            },
+            {
+                "lower": np.array([0, 0, 220]),
+                "upper": np.array([20, 50, 255]),
+                "contaminant": 'Free chlorine',
+                "colour detected": 'Very light lilac/off white',
+                "value": '1 ppm',  # Should be <1
+            },
+            {
+                "lower": np.array([140, 50, 100]),
+                "upper": np.array([150, 100, 180]),
+                "contaminant": 'Free chlorine',
+                "colour detected": 'Violet',
+                "value": '3 ppm',
+            },
+            {
+                "lower": np.array([140, 60, 90]),
+                "upper": np.array([150, 120, 170]),
+                "contaminant": 'Free chlorine',
+                "colour detected": 'Light purple',
+                "value": '5 ppm',
+            },
+            {
+                "lower": np.array([125, 80, 50]),
+                "upper": np.array([150, 200, 150]),
+                "contaminant": 'Free chlorine',
+                "colour detected": 'Purple',
+                "value": '10 ppm',
+            },
+            {
+                "lower": np.array([130, 100, 20]),
+                "upper": np.array([150, 255, 100]),
+                "contaminant": 'Free chlorine',
+                "colour detected": 'Darker purple',
+                "value": '20 ppm',
+            },
+        ],
+    },
+    {
+        "patch_name": "bromine",
+        "colours": [
+            {
+                "lower": np.array([10, 50, 150]),
+                "upper": np.array([20, 150, 255]),
+                "contaminant": 'Bromine',
+                "colour detected": 'Cream',
+                "value": '0 ppm',
+            },
+            {
+                "lower": np.array([25, 30, 180]),
+                "upper": np.array([35, 120, 255]),
+                "contaminant": 'Bromine',
+                "colour detected": 'Pale yellow',
+                "value": '1 ppm',
+            },
+            {
+                "lower": np.array([130, 100, 120]),
+                "upper": np.array([160, 200, 220]),
+                "contaminant": 'Bromine',
+                "colour detected": 'Light purple',
+                "value": '2 ppm',
+            },
+            {
+                "lower": np.array([290, 150, 180]),
+                "upper": np.array([320, 255, 255]),
+                "contaminant": 'Bromine',
+                "colour detected": 'Pink-purple',
+                "value": '6 ppm',
+            },
+            {
+                "lower": np.array([260, 150, 180]),
+                "upper": np.array([300, 255, 255]),
+                "contaminant": 'Bromine',
+                "colour detected": 'Bright purple',
+                "value": '10 ppm',
+            },
+            {
+                "lower": np.array([125, 100, 50]),
+                "upper": np.array([155, 255, 150]),
+                "contaminant": 'Bromine',
+                "colour detected": 'Dark purple',
+                "value": '20 ppm',
+            },
+            {
+                "lower": np.array([130, 150, 40]),
+                "upper": np.array([160, 255, 120]),
+                "contaminant": 'Bromine',
+                "colour detected": 'Deep purple',
+                "value": '40 ppm',
+            },
+        ],
+    },
+    {
+        "patch_name": "total_alkalinity",
+        "colours": [
+            {
+                "lower": np.array([63, 255, 255]),
+                "upper": np.array([57, 255, 255]),
+                "contaminant": 'Total alkalinity',
+                "colour detected": 'Yellow',
+                "value": '0 ppm',
+            },
+            {
+                "lower": np.array([30, 100, 100]),
+                "upper": np.array([85, 255, 255]),
+                "contaminant": 'Total alkalinity',
+                "colour detected": 'Bright lime',
+                "value": '40 ppm',
+            },
+            {
+                "lower": np.array([60, 100, 50]),
+                "upper": np.array([100, 255, 255]),
+                "contaminant": 'Total alkalinity',
+                "colour detected": 'Green',
+                "value": '80 ppm',
+            },
+            {
+                "lower": np.array([80, 100, 50]),
+                "upper": np.array([120, 255, 255]),
+                "contaminant": 'Total alkalinity',
+                "colour detected": 'Fern green',
+                "value": '150 ppm',  # Should be 120-180
+            },
+            {
+                "lower": np.array([85, 100, 100]),
+                "upper": np.array([115, 255, 255]),
+                "contaminant": 'Total alkalinity',
+                "colour detected": 'Aqua',
+                "value": '240 ppm',
+            },
+            {
+                "lower": np.array([85, 100, 50]),
+                "upper": np.array([57, 255, 255]),
+                "contaminant": 'Total alkalinity',
+                "colour detected": 'Dark aqua',
+                "value": '360 ppm',
+            },
+        ],
+    },
+    {
+        "patch_name": "pH",
+        "colours": [
+            {
+                "lower": np.array([25, 100, 100]),
+                "upper": np.array([35, 255, 255]),
+                "contaminant": 'pH',
+                "colour detected": 'Curry yellow',
+                "value": '6.0',
+            },
+            {
+                "lower": np.array([25, 50, 80]),
+                "upper": np.array([30, 100, 200]),
+                "contaminant": 'pH',
+                "colour detected": 'Mustard',
+                "value": '6.8',
+            },
+            {
+                "lower": np.array([10, 100, 50]),
+                "upper": np.array([25, 255, 255]),
+                "contaminant": 'pH',
+                "colour detected": 'Vivid orange',
+                "value": '6.8',
+            },
+            {
+                "lower": np.array([10, 150, 50]),
+                "upper": np.array([25, 255, 200]),
+                "contaminant": 'pH',
+                "colour detected": 'Dark orange',
+                "value": '7.2 - 7.6',
+            },
+            {
+                "lower": np.array([10, 150, 100]),
+                "upper": np.array([20, 255, 255]),
+                "contaminant": 'pH',
+                "colour detected": 'Blood orange',
+                "value": '8.2',
+            },
+            {
+                "lower": np.array([170, 150, 100]),
+                "upper": np.array([180, 255, 255]),
+                "contaminant": 'pH',
+                "colour detected": 'Red',
+                "value": '9.0',
+            },
+        ],
+    },
+]
+'''
+
+colour_shades = [
+    {
+        "patch_name": "total_hardness",
+        "colours": [
+            {
+                "lower": np.array([125, 100, 100]),
+                "upper": np.array([185, 255, 255]),
+                "contaminant": 'Total hardness',
+                "colour detected": 'Dark muted green',
+                "value": '0 ppm',
+            },
+            {
+                "lower": np.array([60, 144, 107]),
+                "upper": np.array([100, 255, 255]),
+                "contaminant": 'Total hardness',
+                "colour detected": 'Muddy green',
+                "value": '25 ppm',
+            },
+            {
+                "lower": np.array([0, 100, 100]),
+                "upper": np.array([60, 255, 255]),
+                "contaminant": 'Total hardness',
+                "colour detected": 'Dark olive green-brown',
+                "value": '50 ppm',
+            },
+            {
+                "lower": np.array([0, 100, 100]), #35
+                "upper": np.array([35, 255, 255]), #85
+                "contaminant": 'Total hardness',
+                "colour detected": 'Red-brown',
+                "value": '120 ppm',
+            },
+            {
+                "lower": np.array([16, 97, 44]), #unchanged
+                "upper": np.array([20, 92, 51]), #unchanged
+                "contaminant": 'Total hardness',
+                "colour detected": 'Burnt-umber red',
+                "value": '250 ppm',
+            },
+            {
+                "lower": np.array([13, 92, 51]),  #unchanged
+                "upper": np.array([16, 96, 50]),  #unchanged
+                "contaminant": 'Total hardness',
+                "colour detected": 'Bright red ochre',
+                "value": '425 ppm',
+            },
+        ],
+    },
+    {
+        "patch_name": "total_chlorine",
+        "colours": [
+            {
+                "lower": np.array([20, 100, 150]),
+                "upper": np.array([103, 255, 255]),
+                "contaminant": 'Total chlorine',
+                "colour detected": 'Light beige/cream',
+                "value": '0 ppm',
+            },
+            {
+                "lower": np.array([44, 100, 100]),
+                "upper": np.array([104, 255, 255]),
+                "contaminant": 'Total chlorine',
+                "colour detected": 'Light lime',
+                "value": '1 ppm',  # Should be <1
+            },
+            {
+                "lower": np.array([46, 100, 100]),
+                "upper": np.array([106, 255, 255]),
+                "contaminant": 'Total chlorine',
+                "colour detected": 'Lime',
+                "value": '3 ppm',
+            },
+            {
+                "lower": np.array([27, 100, 100]),
+                "upper": np.array([87, 255, 155]),
+                "contaminant": 'Total chlorine',
+                "colour detected": 'Pear',
+                "value": '5 ppm',
+            },
+            {
+                "lower": np.array([41, 100, 100]),
+                "upper": np.array([101, 255, 255]),
+                "contaminant": 'Total chlorine',
+                "colour detected": 'Green',
+                "value": '10 ppm',
+            },
+            {
+                "lower": np.array([51, 100, 100]),
+                "upper": np.array([111, 255, 255]),
+                "contaminant": 'Total chlorine',
+                "colour detected": 'Fern green',
+                "value": '20 ppm',
+            },
+        ],
+    },
+    {
+        "patch_name": "free_chlorine",
+        "colours": [
+            {
+                "lower": np.array([0, 100, 100]),
+                "upper": np.array([137,255,255]),
+                "contaminant": 'Free chlorine',
+                "colour detected": 'White',
+                "value": '0 ppm',
+            },
+            {
+                "lower": np.array([80, 100, 100]),
+                "upper": np.array([140,255,255]),
+                "contaminant": 'Free chlorine',
+                "colour detected": 'Very light lilac/off white',
+                "value": '1 ppm',  # Should be <1
+            },
+            {
+                "lower": np.array([103, 100, 100]),
+                "upper": np.array([163,255,255]),
+                "contaminant": 'Free chlorine',
+                "colour detected": 'Violet',
+                "value": '3 ppm',
+            },
+            {
+                "lower": np.array([107, 100, 100]),
+                "upper": np.array([167,255,255]),
+                "contaminant": 'Free chlorine',
+                "colour detected": 'Light purple',
+                "value": '5 ppm',
+            },
+            {
+                "lower": np.array([112, 100, 100]),
+                "upper": np.array([172,255,255]),
+                "contaminant": 'Free chlorine',
+                "colour detected": 'Purple',
+                "value": '10 ppm',
+            },
+            {
+                "lower": np.array([109, 100, 100]),
+                "upper": np.array([169, 255, 255]),
+                "contaminant": 'Free chlorine',
+                "colour detected": 'Darker purple',
+                "value": '20 ppm',
+            },
+        ],
+    },
+    {
+        "patch_name": "bromine",
+        "colours": [
+            {
+                "lower": np.array([70, 100, 100]),
+                "upper": np.array([130, 255, 255]),
+                "contaminant": 'Bromine',
+                "colour detected": 'Cream',
+                "value": '0 ppm',
+            },
+            {
+                "lower": np.array([67, 100, 100]),
+                "upper": np.array([127, 255, 255]),
+                "contaminant": 'Bromine',
+                "colour detected": 'Pale yellow',
+                "value": '1 ppm',
+            },
+            {
+                "lower": np.array([52, 100, 100]),
+                "upper": np.array([112, 255, 255]),
+                "contaminant": 'Bromine',
+                "colour detected": 'Light purple',
+                "value": '2 ppm',
+            },
+            {
+                "lower": np.array([129, 100, 100]),
+                "upper": np.array([189, 255, 255]),
+                "contaminant": 'Bromine',
+                "colour detected": 'Pink-purple',
+                "value": '6 ppm',
+            },
+            {
+                "lower": np.array([120, 100, 100]),
+                "upper": np.array([180, 255, 255]),
+                "contaminant": 'Bromine',
+                "colour detected": 'Bright purple',
+                "value": '10 ppm',
+            },
+            {
+                "lower": np.array([114, 100, 100]),
+                "upper": np.array([174, 255, 255]),
+                "contaminant": 'Bromine',
+                "colour detected": 'Dark purple',
+                "value": '20 ppm',
+            },
+            {
+                "lower": np.array([112, 100, 100]),
+                "upper": np.array([172, 255, 255]),
+                "contaminant": 'Bromine',
+                "colour detected": 'Deep purple',
+                "value": '40 ppm',
+            },
+        ],
+    },
+    {
+        "patch_name": "total_alkalinity",
+        "colours": [
+            {
+                "lower": np.array([2, 100, 100]),
+                "upper": np.array([62, 255, 255]),
+                "contaminant": 'Total alkalinity',
+                "colour detected": 'Yellow',
+                "value": '0 ppm',
+            },
+            {
+                "lower": np.array([9, 100, 100]),
+                "upper": np.array([69, 255, 255]),
+                "contaminant": 'Total alkalinity',
+                "colour detected": 'Bright lime',
+                "value": '40 ppm',
+            },
+            {
+                "lower": np.array([40, 100, 50]),
+                "upper": np.array([100, 255, 255]),
+                "contaminant": 'Total alkalinity',
+                "colour detected": 'Green',
+                "value": '80 ppm',
+            },
+            {
+                "lower": np.array([52, 100, 100]),
+                "upper": np.array([120, 255, 255]),
+                "contaminant": 'Total alkalinity',
+                "colour detected": 'Fern green',
+                "value": '150 ppm',  # Should be 120-180
+            },
+            {
+                "lower": np.array([64, 100, 100]),
+                "upper": np.array([120, 255, 255]),
+                "contaminant": 'Total alkalinity',
+                "colour detected": 'Aqua',
+                "value": '240 ppm',
+            },
+            {
+                "lower": np.array([69, 100, 100]),
+                "upper": np.array([129, 255, 255]),
+                "contaminant": 'Total alkalinity',
+                "colour detected": 'Dark aqua',
+                "value": '360 ppm',
+            },
+        ],
+    },
+    {
+        "patch_name": "pH",
+        "colours": [
+            {
+                "lower": np.array([25, 100, 100]),
+                "upper": np.array([35, 255, 255]),
+                "contaminant": 'pH',
+                "colour detected": 'Curry yellow',
+                "value": '6.0',
+            },
+            {
+                "lower": np.array([25, 50, 80]),
+                "upper": np.array([57, 255, 255]),
+                "contaminant": 'pH',
+                "colour detected": 'Mustard',
+                "value": '6.4',
+            },
+            {
+                "lower": np.array([10, 100, 50]),
+                "upper": np.array([46, 255, 255]),
+                "contaminant": 'pH',
+                "colour detected": 'Vivid orange',
+                "value": '6.8',
+            },
+            {
+                "lower": np.array([10, 150, 100]),
+                "upper": np.array([38, 255, 200]),
+                "contaminant": 'pH',
+                "colour detected": 'Dark orange',
+                "value": '7.2 - 7.6',
+            },
+            {
+                "lower": np.array([10, 150, 100]),
+                "upper": np.array([207, 255, 255]),
+                "contaminant": 'pH',
+                "colour detected": 'Blood orange',
+                "value": '8.2',
+            },
+            {
+                "lower": np.array([146, 150, 100]),
+                "upper": np.array([206, 255, 255]),
+                "contaminant": 'pH',
+                "colour detected": 'Red',
+                "value": '9.0',
+            },
+        ],
+    },
+]
+
+
+# Check that all six patches are visible/detected #
+def check_all_patches_detected(detections):
+    # Check if detections are in list format (from color_results) or dict (raw patch data)
+    if isinstance(detections, list):
+        detected_patches = {d['patch_name'] for d in detections if 'patch_name' in d}
+    else:
+        detected_patches = set(detections.keys())  # Use keys from the dictionary
+
+    required_patches = {'total_hardness', 'total_chlorine', 'free_chlorine', 'bromine', 'total_alkalinity', 'pH'}
+
+    # Debugging logs
+    print(f"Detected patches: {detected_patches}")
+    print(f"Required patches: {required_patches}")
+
+    return required_patches.issubset(detected_patches)
+
+
+# Colour extraction and classification code #
+def extract_colours(image):
+    # Convert image from BGR to HSV
+    hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    height, width, _ = hsv_image.shape
+
+    # Initialise the result dictionary
+    colour_results = {}
+
+    # Iterate through each patch
+    for patch in colour_shades:
+        patch_name = patch["patch_name"]
+        best_match = None
+        highest_detection = 0
+
+        # Iterate through each colour in the patch
+        for color in patch["colours"]:
+            lower_bound = np.array(color["lower"], dtype=np.uint8)
+            upper_bound = np.array(color["upper"], dtype=np.uint8)
+
+            # Create mask for the colour range
+            mask = cv2.inRange(hsv_image, lower_bound, upper_bound)
+            colour_detected = np.sum(mask > 0) / (width * height)
+
+            # Debugging output
+            print(f"Check: Patch: {patch_name}, Colour Detected: {color['colour detected']}, Detection Rate: {colour_detected}")
+
+            # Update the best match if this color has a higher detection rate
+            if colour_detected > highest_detection:
+                highest_detection = colour_detected
+                best_match = {
+                    "colour detected": color["colour detected"],
+                    "contaminant": color["contaminant"],
+                    "value": color["value"],
+                    "colour_detected": colour_detected
+                }
+
+        # Store the best match for the patch or an empty list if no colour matched
+        if best_match:
+            colour_results[patch_name] = [best_match]
+        else:
+            print(f"No colors detected for patch: {patch_name}")
+            colour_results[patch_name] = []
+
+    print(f"Colour_results: {colour_results}")
+    return colour_results
+
+
+# Safety analysis logic
+def determine_water_safety(colour_results_str):
+    # Parse the JSON string into a dictionary
+    try:
+        if isinstance(colour_results_str, str):
+            colour_results = json.loads(colour_results_str)
+        else:
+            colour_results = colour_results_str  # Already a dictionary, no need to parse
+    except json.JSONDecodeError as e:
+        print(f"Error decoding JSON: {e}")
+        # return 'Cannot analyse test strip. Please try again.'
+
+    # Check if all required patches are detected     --- is this necessary?
+    if not check_all_patches_detected(colour_results):
+        print("Not all required patches are detected. Cannot analyze test strip.")
+        # return 'Cannot analyse test strip. Please try again.'
+
+    # Ensure exactly 6 patches are present and have valid color data
+    if len(colour_results) != 6 or any(not color_data for patch_name, color_data in colour_results.items()):
+        print(f"Incomplete or missing data for one or more patches. Cannot analyze test strip.")
+        # return 'Cannot analyse test strip. Please try again.'
+
+    safe = True
+    print("Updated colour_results:", colour_results)
+
+    # Check each patch's color and value to determine safety
+    for patch_name, color_data in colour_results.items():
+        if not color_data:  # Handle empty lists
+            print(f"Error: No color detected for {patch_name}.")
+            # return 'Cannot analyse test strip. Please try again.'
+
+        # Access the first color match
+        color_data = color_data[0]  # Assuming the first item is the relevant one
+        if color_data["colour_detected"] is None:
+            print(f"Error: No color detected for {patch_name}.")
+            # return 'Cannot analyse test strip. Please try again.'
+
+        # Parse the value of the contaminant (strip the units and convert to float)
+        value_str = color_data.get("value", "0.0")
+        try:
+            value = float(value_str.split(' ')[0])
+        except (ValueError, IndexError) as e:
+            print(f"Error parsing value for {patch_name}: {value_str}")
+            # return 'Cannot analyse test strip. Please try again.'
+
+        # Add safety conditions based on patch values
+        if patch_name == 'total_hardness' and value > 120:
+            print(f"Total hardness out of safe range: {value}")
+            safe = False
+            break
+        elif patch_name == 'total_chlorine' and value > 5:
+            print(f"Total chlorine out of safe range: {value}")
+            safe = False
+            break
+        elif patch_name == 'free_chlorine' and value > 3:
+            print(f"Free chlorine out of safe range: {value}")
+            safe = False
+            break
+        elif patch_name == 'bromine' and value > 1:
+            print(f"Bromine out of safe range: {value}")
+            safe = False
+            break
+        elif patch_name == 'total_alkalinity' and value > 360:
+            print(f"Total alkalinity out of safe range: {value}")
+            safe = False
+            break
+        elif patch_name == 'pH' and (value < 6.4 or value > 8.2):
+            print(f"pH out of safe range: {value}")
+            safe = False
+            break
+
+    # Return water safety status based on analysis
+    safety_status = "safe" if safe else "unsafe"
+    print(f"\nThe water sample is {safety_status} to drink.")
+
+    return safety_status
+
+
+# Export data to Firebase #
+
+# FB service account key file
+projectFile = credentials.Certificate('C:/Users/user/PycharmProjects/pythonProject10/mapping-water-firebase-admin.json')
+
+firebase_admin.initialize_app(projectFile, {
+    'storageBucket': 'mapping-water.appspot.com'  # Firebase Storage bucket ID
+})
+
+# Access Firestore
+db = firestore.client()
+bucket = storage.bucket()
+
+
+def upload_image_to_storage(image_file):
+    try:
+        # Generate a timestamp-based filename for uniqueness
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f'image_{timestamp}.jpg'
+        folder_path = 'test_strip_images/'  # Folder path in Firebase Storage
+        blob = bucket.blob(f'{folder_path}{filename}')
+
+        # Upload the image file from the FileStorage object
+        blob.upload_from_file(image_file)
+
+        # Get the public URL of the uploaded image
+        image_url = blob.public_url
+        print(f"Image uploaded successfully. Public URL: {image_url}")
+        return image_url
+    except Exception as e:
+        print(f"Error uploading image to Firebase Storage: {e}")
+        return None
+
+
+def convert_to_degrees(value):
+    """
+    Helper function to convert the GPS coordinates stored as
+    [degrees, minutes, seconds] into decimal degrees.
+    """
+    degrees = value[0]
+    minutes = value[1] / 60.0
+    seconds = value[2] / 3600.0 if len(value) > 2 else 0
+    return degrees + minutes + seconds
+
+
+def extract_gps_from_image(image_file):
+    """
+    Extract GPS data from an image's EXIF metadata.
+    Specifically for Android mobile devices.
+    """
+    try:
+        image = Image.open(image_file)
+        exif_data = image._getexif()
+        gps_info = None
+
+        if exif_data:
+            # Iterate over EXIF data to find GPSInfo
+            for tag, value in exif_data.items():
+                tag_name = TAGS.get(tag, tag)
+                if tag_name == 'GPSInfo':
+                    gps_info = value
+                    break
+
+        if gps_info:
+            # Dictionary to store GPS data
+            gps_data = {}
+            for key in gps_info.keys():
+                gps_tag = GPSTAGS.get(key, key)
+                gps_data[gps_tag] = gps_info[key]
+
+            # Check for Android EXIF GPS data (latitude and longitude)
+            if 'GPSLatitude' in gps_data and 'GPSLongitude' in gps_data:
+                lat = convert_to_degrees(gps_data['GPSLatitude'])
+                lon = convert_to_degrees(gps_data['GPSLongitude'])
+
+                # Handle N/S and E/W directions (common in Android EXIF)
+                lat_ref = gps_data.get('GPSLatitudeRef', 'N')
+                lon_ref = gps_data.get('GPSLongitudeRef', 'E')
+
+                if lat_ref == 'S':
+                    lat = -lat
+                if lon_ref == 'W':
+                    lon = -lon
+
+                print(f"Extracted GPS coordinates: {lat}, {lon}")
+                return lat, lon
+            else:
+                print("No GPS Latitude or Longitude found in EXIF.")
+                return None, None
+        else:
+            print("No GPSInfo EXIF data found.")
+            return None, None
+
+    except Exception as e:
+        print(f"Error reading image or extracting GPS data: {e}")
+        return None, None
+
+
+def extract_contaminants_from_results(colour_results_str):
+    contaminants = []
+
+    # Check if colour_results_str is already a dictionary or JSON string
+    if isinstance(colour_results_str, str):
+        try:
+            colour_results = json.loads(colour_results_str)
+        except json.JSONDecodeError as e:
+            print(f"Colour results error decoding JSON: {e}")
+            return contaminants
+    else:
+        colour_results = colour_results_str  # Assume it's already a dictionary
+
+    # Iterate through patches and extract relevant contaminant values
+    for patch_name, colors in colour_results.items():
+        if not colors:
+            print(f"No colors detected for patch: {patch_name}")
+            continue
+        color = colors[0]  # Assuming the first item is the relevant one
+        contaminant_value = color.get('value', '0.0')
+        contaminants.append({
+            patch_name: contaminant_value
+        })
+
+    # Print contaminants for debugging
+    print(f"Contaminants: {contaminants}")
+    return contaminants
+
+
+def get_next_user_id():
+    db = firestore.client()
+    users_ref = db.collection('UserGeneratedData').order_by('UserID', direction=firestore.Query.DESCENDING).limit(1)
+    last_user_doc = users_ref.get()
+    if last_user_doc:
+        last_user_id = last_user_doc[0].get('UserID')
+        return last_user_id + 1
+    return 1
+
+
+def upload_data_to_firestore(image_url, colour_results_str, lat=None, lon=None):
+    contaminants = extract_contaminants_from_results(colour_results_str)
+    safety_flag = determine_water_safety(colour_results_str)
+    user_id = get_next_user_id()
+
+    data = {
+        'ChemicalParameters': contaminants,
+        'DateTime': firestore.SERVER_TIMESTAMP,
+        'Location': {
+            'latitude': lat,
+            'longitude': lon
+        },
+        'SafetyFlag': safety_flag,
+        'UserID': user_id,
+        'ImageURL': image_url
+    }
+
+    try:
+        db.collection('UserGeneratedData').add(data)
+        print("Data uploaded successfully!")
+    except Exception as e:
+        print(f"Error uploading data to Firestore. Check code: {e}")
+
+
+# API endpoint to handle image processing
+
+@app.route('/process_image', methods=['POST'])
+def process_image():
+    if 'image' not in request.files:
+        return jsonify({"error": "No image file provided"}), 404
+
+    image_file = request.files['image']
+    image_bytes = image_file.read()
+
+    # Upload the image to Firebase Storage
+    image_url = upload_image_to_storage(BytesIO(image_bytes))  # Passing BytesIO stream
+
+    if image_url:
+        # Process the image for local file case
+        image = Image.open(BytesIO(image_bytes))  # Reuse the in-memory bytes for processing
+        image_cv2 = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+
+        adjusted_image = adjust_brightness(image_cv2)
+
+        result = detect_objects(adjusted_image)
+        detections, detected_classes, orientation_acceptable = result[:3]  # Only take the first three values
+
+        # Detect objects
+        detections, detected_classes, orientation_acceptable = detect_objects(adjusted_image)
+
+        # Debugging
+        print(f"Detections: {detections} (Type: {type(detections)})")
+
+        # Ensure detections is a list of dicts
+        if isinstance(detections, str):
+            return jsonify({"error": "Invalid detections format"}), 400
+
+        if not check_all_patches_detected(detections):
+            return jsonify({"error": "Not all required patches detected. Please recapture the image."}), 500
+
+        white_balanced_image = perform_white_balance(adjusted_image)
+        glare_removed_image = remove_glare(white_balanced_image)
+
+        updated_colour_results = extract_colours(glare_removed_image)
+        water_safety = determine_water_safety(updated_colour_results)
+
+        try:
+            contaminants = extract_contaminants_from_results(updated_colour_results)
+
+            # Extract GPS data if the image is local
+            gps_lat, gps_lon = extract_gps_from_image(BytesIO(image_bytes))
+
+            # Upload processed data to Firestore
+            upload_data_to_firestore(image_url, updated_colour_results, gps_lat, gps_lon)
+
+            # Create the result object to send to the Flutter app
+            result = {
+                "resultDetails": json.dumps({
+                    #"detections": detections,
+                    #"orientation_acceptable": orientation_acceptable,
+                    #"colour_results": updated_colour_results,
+                    "contaminants": contaminants,
+                    "water_safety": water_safety
+                })
+            }
+
+            print(result)
+            return jsonify(result), 200
+
+        except Exception as e:
+            print(f"Error processing image: {e}")
+            return jsonify({'error': 'Failed to return image results'}), 700
+
+    else:
+        return jsonify({"error": "Failed to upload image"}), 600
+
+
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=3001)
+
+
+
